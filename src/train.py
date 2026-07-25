@@ -6,7 +6,7 @@ Run: python3 src/train.py
 import pandas as pd
 import numpy as np
 import mlflow
-import mlflow.xgboost
+import mlflow.sklearn
 import optuna
 import xgboost as xgb
 import matplotlib
@@ -94,7 +94,27 @@ def main():
             mlflow.log_figure(fig, "feature_importance.png")
             plt.close(fig)
 
-            mlflow.xgboost.log_model(model, name="model")
+            # IMPORTANT: log the FULL pipeline (preprocessing + model), not just
+            # the bare classifier. The preprocessor was already fit above on
+            # X_train (raw columns), so wrapping it here doesn't refit it --
+            # Pipeline.predict()/predict_proba() will call preprocessor.transform()
+            # then the classifier, exactly like at serving time. This means
+            # whatever loads this model later (Phase 3's registry evaluation,
+            # Phase 4's FastAPI endpoint) can hand it a raw dataframe with the
+            # original column names and get a prediction back directly --
+            # no separate preprocessing step to keep in sync by hand.
+            full_pipeline = Pipeline(steps=[
+                ("preprocessor", preprocessor),
+                ("classifier", model),
+            ])
+            # NOTE: MLflow's sklearn flavor defaults to "skops" serialization
+            # (a safer pickle alternative), but skops refuses to serialize
+            # XGBoost's internal Booster/XGBClassifier types unless you
+            # explicitly trust them. cloudpickle is the older, more universally
+            # compatible format and is the standard choice here.
+            mlflow.sklearn.log_model(
+                full_pipeline, name="model", serialization_format="cloudpickle"
+            )
 
             if auc > best_auc["value"]:
                 best_auc["value"] = auc

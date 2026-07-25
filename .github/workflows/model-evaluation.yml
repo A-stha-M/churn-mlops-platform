@@ -1,0 +1,56 @@
+name: Model Evaluation and Promotion
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # also allows manually triggering a run from the GitHub UI
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Java (required by PySpark)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # mlflow.db is gitignored (correctly -- it's a generated artifact, not
+      # source code), which means a fresh GitHub Actions runner has NO record
+      # of any previous @champion. Without this cache step, every run would
+      # start from zero and the "champion vs challenger" comparison would be
+      # meaningless. actions/cache persists mlflow.db between workflow runs
+      # using the runner's cache storage, keyed loosely enough (restore-keys)
+      # to pull forward the most recent version even though github.run_id
+      # changes every time.
+      - name: Restore MLflow tracking store from previous run
+        uses: actions/cache@v4
+        with:
+          path: mlflow.db
+          key: mlflow-db-${{ github.run_id }}
+          restore-keys: |
+            mlflow-db-
+
+      - name: Run data ingestion
+        run: python src/spark_ingest.py
+
+      - name: Validate data contract
+        run: python src/validate_data.py data/spark_cleaned_churn.csv
+
+      - name: Train and register challenger model
+        run: |
+          python src/train.py
+          python src/register_model.py
+
+      - name: Evaluate challenger vs champion, promote if better
+        run: python tests/evaluate_and_promote.py
