@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, "src")
 from train import NUMERIC_FEATURES, CATEGORICAL_FEATURES
+from db_logger import init_db, log_prediction, close_pool
 
 MODEL_NAME = "churn_xgboost_model"
 
@@ -46,9 +47,12 @@ async def lifespan(app: FastAPI):
     ml_models["explainer"] = explainer
     ml_models["feature_names"] = preprocessor.get_feature_names_out()
 
+    await init_db()  # creates the predictions table if it doesn't exist yet
+
     print(f"Loaded '{MODEL_NAME}@champion' and built SHAP explainer.")
     yield
-    # --- SHUTDOWN --- (nothing to clean up here, but this is where you would)
+    # --- SHUTDOWN ---
+    await close_pool()
     ml_models.clear()
 
 
@@ -132,5 +136,11 @@ async def predict(request: ChurnRequest):
 
     prob = ml_models["pipeline"].predict_proba(input_df)[0, 1]
     top_drivers = get_top_drivers(input_df)
+
+    # Fire off the log write. In a very high-throughput API you might use
+    # BackgroundTasks so this doesn't add latency to the response at all --
+    # here we await it directly since it's a single fast INSERT and keeping
+    # it simple matters more than shaving off a few milliseconds.
+    await log_prediction(request.model_dump(), float(prob), top_drivers)
 
     return ChurnResponse(churn_probability=round(float(prob), 4), top_drivers=top_drivers)
