@@ -1,17 +1,13 @@
-"""
-Phase 4 — FastAPI serving layer with SHAP-based explainability.
-
-Run: uvicorn src.serve:app --reload --port 8000
-Then: POST http://localhost:8000/predict  (see example payload in README)
-"""
-
+import os
 import sys
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 import mlflow
 import pandas as pd
 import shap
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 sys.path.insert(0, "src")
@@ -19,27 +15,31 @@ from train import NUMERIC_FEATURES, CATEGORICAL_FEATURES
 from db_logger import init_db, log_prediction, close_pool
 
 MODEL_NAME = "churn_xgboost_model"
-
-# Populated at startup, not per-request -- loading a model on every single
-# request would add seconds of latency to what should be a fast API call.
+DEPLOYED_MODEL_PATH = Path(__file__).resolve().parent.parent / "deployed_model"
 ml_models = {}
+
+
+def load_champion_pipeline():
+    """
+    Prefers the committed deployed_model/ folder (what a deployed server has
+    available) and only falls back to the live MLflow registry if that
+    folder doesn't exist -- which is the normal case for local development,
+    where mlflow.db + mlruns/ are present and up to date with every trial.
+    """
+    if DEPLOYED_MODEL_PATH.exists():
+        print(f"Loading model from committed folder: {DEPLOYED_MODEL_PATH}")
+        return mlflow.sklearn.load_model(str(DEPLOYED_MODEL_PATH))
+
+    print("No deployed_model/ folder found -- loading live from MLflow registry (local dev mode).")
+    mlflow.set_tracking_uri("sqlite:///mlflow.db")
+    return mlflow.sklearn.load_model(f"models:/{MODEL_NAME}@champion")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- STARTUP ---
-    mlflow.set_tracking_uri("sqlite:///mlflow.db")
-
-    # Load the FULL pipeline (preprocessor + classifier) via mlflow.sklearn,
-    # NOT mlflow.pyfunc -- we need direct access to the individual pipeline
-    # steps below, which the generic pyfunc wrapper doesn't expose.
-    full_pipeline = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}@champion")
+    full_pipeline = load_champion_pipeline()
     preprocessor = full_pipeline.named_steps["preprocessor"]
     classifier = full_pipeline.named_steps["classifier"]
-
-    # TreeExplainer is the fast, EXACT SHAP method for tree-based models
-    # (XGBoost, LightGBM, random forests) -- don't reach for the generic
-    # KernelExplainer here, it's slow and only needed for black-box models.
     explainer = shap.TreeExplainer(classifier)
 
     ml_models["pipeline"] = full_pipeline
@@ -47,16 +47,21 @@ async def lifespan(app: FastAPI):
     ml_models["explainer"] = explainer
     ml_models["feature_names"] = preprocessor.get_feature_names_out()
 
-    await init_db()  # creates the predictions table if it doesn't exist yet
-
+    await init_db()
     print(f"Loaded '{MODEL_NAME}@champion' and built SHAP explainer.")
     yield
-    # --- SHUTDOWN ---
     await close_pool()
     ml_models.clear()
 
 
 app = FastAPI(title="Churn Prediction API", lifespan=lifespan)
+
+# Allows the Streamlit dashboard (running on a different port) to call this API
+# directly from the browser if needed -- permissive here since this is a local
+# demo project, not a public-facing production deployment.
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
 
 
 class ChurnRequest(BaseModel):
@@ -80,20 +85,6 @@ class ChurnRequest(BaseModel):
     paperless_billing: str
     payment_method: str
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "tenure": 2, "monthly_charges": 95.0, "total_charges": 190.0,
-                "senior_citizen": 0, "gender": "Female", "partner": "No",
-                "dependents": "No", "phone_service": "Yes", "multiple_lines": "No",
-                "internet_service": "Fiber optic", "online_security": "No",
-                "online_backup": "No", "device_protection": "No", "tech_support": "No",
-                "streaming_tv": "Yes", "streaming_movies": "Yes",
-                "contract_type": "Month-to-month", "paperless_billing": "Yes",
-                "payment_method": "Electronic check",
-            }
-        }
-
 
 class ChurnResponse(BaseModel):
     churn_probability: float
@@ -104,16 +95,8 @@ def get_top_drivers(input_df: pd.DataFrame, top_n: int = 3) -> dict:
     transformed = ml_models["preprocessor"].transform(input_df)
     row_shap = ml_models["explainer"].shap_values(transformed)[0]
     feature_names = ml_models["feature_names"]
-
-    contributions = sorted(
-        zip(feature_names, row_shap), key=lambda x: abs(x[1]), reverse=True
-    )[:top_n]
-    # sklearn's ColumnTransformer prefixes names with the transformer they
-    # came from (e.g. "cat__contract_type_Month-to-month") -- clean, useful
-    # internally, but noisy in an API response meant for a human/dashboard
-    # to read. Strip the "num__"/"cat__" prefix for a nicer output.
-    cleaned = {name.split("__", 1)[-1]: round(float(val), 4) for name, val in contributions}
-    return cleaned
+    contributions = sorted(zip(feature_names, row_shap), key=lambda x: abs(x[1]), reverse=True)[:top_n]
+    return {name.split("__", 1)[-1]: round(float(val), 4) for name, val in contributions}
 
 
 @app.get("/health")
@@ -127,20 +110,10 @@ async def predict(request: ChurnRequest):
         raise HTTPException(status_code=503, detail="Model not loaded yet")
 
     input_df = pd.DataFrame([request.model_dump()])
-
-    # NUMERIC_FEATURES/CATEGORICAL_FEATURES order must match training exactly --
-    # ColumnTransformer selects by NAME internally so order in the dict doesn't
-    # actually matter here, but keeping columns limited to exactly what the
-    # model was trained on avoids silently passing through unexpected extras.
     input_df = input_df[NUMERIC_FEATURES + CATEGORICAL_FEATURES]
 
     prob = ml_models["pipeline"].predict_proba(input_df)[0, 1]
     top_drivers = get_top_drivers(input_df)
 
-    # Fire off the log write. In a very high-throughput API you might use
-    # BackgroundTasks so this doesn't add latency to the response at all --
-    # here we await it directly since it's a single fast INSERT and keeping
-    # it simple matters more than shaving off a few milliseconds.
     await log_prediction(request.model_dump(), float(prob), top_drivers)
-
     return ChurnResponse(churn_probability=round(float(prob), 4), top_drivers=top_drivers)
