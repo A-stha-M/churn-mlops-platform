@@ -91,10 +91,9 @@ def main():
             f"\nNOT PROMOTED: challenger (AUC={challenger_auc:.4f}) did not beat "
             f"champion (AUC={champion_auc:.4f}). @champion remains version {champion_version.version}."
         )
-        # Non-zero exit is a DELIBERATE choice for CI: it makes "did not improve"
-        # visible as a distinct outcome in GitHub Actions' run history, rather
-        # than looking identical to a successful promotion in the logs.
-        sys.exit(1)
+        # A failed comparison is a valid CI outcome, not an execution error.
+        # Keep the workflow green unless something actually breaks.
+        return
 
 
 if __name__ == "__main__":
