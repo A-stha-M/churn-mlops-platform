@@ -13,6 +13,7 @@ Requires: the FastAPI app (src/serve.py) running separately on port 8000.
 import os
 import json
 import sys
+from pathlib import Path
 
 import pandas as pd
 import mysql.connector
@@ -37,6 +38,7 @@ from db_logger import DB_CONFIG
 from monitoring import calculate_psi, psi_verdict, NUMERIC_DRIFT_FEATURES
 
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 st.set_page_config(page_title="Churn Model Dashboard", layout="wide")
 st.title("Churn Prediction — Operational Dashboard")
@@ -65,7 +67,7 @@ def load_predictions() -> pd.DataFrame:
 
 @st.cache_data(ttl=30)
 def load_training_data() -> pd.DataFrame:
-    return pd.read_csv("data/spark_cleaned_churn.csv")
+    return pd.read_csv(REPO_ROOT / "data" / "spark_cleaned_churn.csv")
 
 
 tab_predict, tab_overview, tab_db = st.tabs(
