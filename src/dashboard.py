@@ -67,7 +67,41 @@ def load_predictions() -> pd.DataFrame:
 
 @st.cache_data(ttl=30)
 def load_training_data() -> pd.DataFrame:
-    return pd.read_csv(REPO_ROOT / "data" / "spark_cleaned_churn.csv")
+    cleaned_path = REPO_ROOT / "data" / "spark_cleaned_churn.csv"
+    if cleaned_path.exists():
+        return pd.read_csv(cleaned_path)
+
+    raw_path = REPO_ROOT / "data" / "raw_telco_churn.csv"
+    df = pd.read_csv(raw_path)
+
+    df = df.rename(
+        columns={
+            "customerID": "customer_id",
+            "SeniorCitizen": "senior_citizen",
+            "Partner": "partner",
+            "Dependents": "dependents",
+            "PhoneService": "phone_service",
+            "MultipleLines": "multiple_lines",
+            "InternetService": "internet_service",
+            "OnlineSecurity": "online_security",
+            "OnlineBackup": "online_backup",
+            "DeviceProtection": "device_protection",
+            "TechSupport": "tech_support",
+            "StreamingTV": "streaming_tv",
+            "StreamingMovies": "streaming_movies",
+            "Contract": "contract_type",
+            "PaperlessBilling": "paperless_billing",
+            "PaymentMethod": "payment_method",
+            "MonthlyCharges": "monthly_charges",
+            "TotalCharges": "total_charges",
+            "Churn": "churn_raw",
+            "gender": "gender",
+        }
+    )
+    df["total_charges"] = pd.to_numeric(df["total_charges"], errors="coerce").fillna(0.0)
+    df["senior_citizen"] = pd.to_numeric(df["senior_citizen"], errors="coerce").fillna(0).astype(int)
+    df["churn"] = (df["churn_raw"] == "Yes").astype(int)
+    return df.drop(columns=["churn_raw"])
 
 
 tab_predict, tab_overview, tab_db = st.tabs(
